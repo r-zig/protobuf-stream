@@ -38,38 +38,38 @@ where
         reader: &mut BufReader<R>,
         mut buffer: &mut BytesMut,
         cx: &mut Context<'_>,
-    ) -> Result<Option<usize>, io::Error> {
+    ) -> Poll<Result<Option<usize>, io::Error>> {
         if buffer.is_empty() {
             let read_count = match Pin::new(&mut *reader).poll_fill_buf(cx) {
                 Poll::Ready(Ok(buf)) => {
                     if buf.is_empty() {
-                        return Ok(None); // EOF
+                        return Poll::Ready(Ok(None)); // EOF
                     }
                     buffer.extend_from_slice(buf);
                     buf.len()
                 }
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Pending => return Err(io::Error::new(io::ErrorKind::WouldBlock, "Pending")),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             };
             reader.consume(read_count);
         }
         match prost::encoding::decode_varint(&mut buffer) {
             Ok(len) => {
                 if len < MINIMUM_MESSAGE_SIZE as u64 {
-                    return Err(io::Error::new(
+                    return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
                             "Message length {} is less than minimum size {}",
                             len, MINIMUM_MESSAGE_SIZE
                         ),
-                    ));
+                    )));
                 }
-                Ok(Some(len as usize))
+                Poll::Ready(Ok(Some(len as usize)))
             }
-            Err(e) => Err(io::Error::new(
+            Err(e) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Failed to decode varint. decode error: ".to_owned() + &e.to_string(),
-            )),
+            ))),
         }
     }
 
@@ -78,27 +78,27 @@ where
         buffer: &mut BytesMut,
         message_size: usize,
         cx: &mut Context<'_>,
-    ) -> Result<(), io::Error> {
+    ) -> Poll<Result<(), io::Error>> {
         while buffer.len() < message_size {
             let mut temp_buf = vec![0; message_size - buffer.len()];
             let mut read_buf = ReadBuf::new(&mut temp_buf);
             match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
-                    return Err(io::Error::new(
+                    return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "Unexpected EOF",
-                    ));
+                    )));
                 }
                 Poll::Ready(Ok(())) => {
                     buffer.extend_from_slice(read_buf.filled());
                     reader.consume(read_buf.filled().len());
                 }
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Pending => return Err(io::Error::new(io::ErrorKind::WouldBlock, "Pending")),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         }
 
-        Ok(())
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -114,18 +114,21 @@ where
 
         // Step 1: Read the length prefix
         let message_size = match Self::read_length_prefix(&mut this.reader, &mut this.buffer, cx) {
-            Ok(Some(len)) => len,
-            Ok(None) => return Poll::Ready(None), // EOF
-            Err(e) => {
+            Poll::Ready(Ok(Some(len))) => len,
+            Poll::Ready(Ok(None)) => return Poll::Ready(None), // EOF
+            Poll::Ready(Err(e)) => {
                 return Poll::Ready(Some(Err(e))); // Return the error immediately
             }
+            Poll::Pending => return Poll::Pending, // Wait for more data
         };
 
         // Step 2: Read the message payload (only if no error occurred)
-        if let Err(e) =
-            Self::read_message_payload(&mut this.reader, &mut this.buffer, message_size, cx)
-        {
-            return Poll::Ready(Some(Err(e)));
+        match Self::read_message_payload(&mut this.reader, &mut this.buffer, message_size, cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Pending => return Poll::Pending, // Wait for more data
+            Poll::Ready(Err(e)) => {
+                return Poll::Ready(Some(Err(e))); // Return the error immediately
+            }
         }
 
         // Step 3: Decode the Protobuf message (only if no error occurred)
@@ -153,6 +156,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use bytes::Buf;
     use bytes::Bytes;
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -164,6 +168,45 @@ mod tests {
     pub struct MyMessage {
         #[prost(string, tag = "1")]
         pub data: String,
+    }
+
+    // A custom AsyncRead implementation that delays data availability
+    struct DelayedReader {
+        data: Bytes,
+        delay_steps: usize,
+        step: usize,
+    }
+
+    impl DelayedReader {
+        fn new(data: Bytes, delay_steps: usize) -> Self {
+            Self {
+                data,
+                delay_steps,
+                step: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for DelayedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.step < self.delay_steps {
+                // Simulate delay by returning Poll::Pending
+                self.step += 1;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            // Provide data after the delay
+            let len = std::cmp::min(buf.remaining(), self.data.len());
+            buf.put_slice(&self.data[..len]);
+            self.data.advance(len);
+
+            Poll::Ready(Ok(()))
+        }
     }
 
     #[test]
@@ -317,5 +360,44 @@ mod tests {
         }
 
         assert_eq!(decoded_messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_protobuf_stream_with_delayed_data() {
+        // Prepare the expected messages
+        let expected_messages = vec![
+            MyMessage {
+                data: "message 1".to_owned(),
+            },
+            MyMessage {
+                data: "message 2".to_owned(),
+            },
+        ];
+
+        // Encode the messages into a buffer
+        let mut buf = vec![];
+        for message in &expected_messages {
+            message.encode_length_delimited(&mut buf).unwrap();
+        }
+        let buf: Bytes = Bytes::from(buf);
+
+        // Create a DelayedReader with a delay of 3 steps
+        let reader = DelayedReader::new(buf, 3);
+        let reader = BufReader::new(reader);
+
+        // Create the ProtobufStream
+        let mut stream = ProtobufStream::<_, MyMessage>::new(reader);
+
+        // Read the messages from the stream
+        let mut decoded_messages = vec![];
+        while let Some(message) = stream.next().await {
+            match message {
+                Ok(msg) => decoded_messages.push(msg),
+                Err(e) => panic!("Unexpected error: {}", e),
+            }
+        }
+
+        // Verify the decoded messages match the expected messages
+        assert_eq!(expected_messages, decoded_messages);
     }
 }
