@@ -1,9 +1,11 @@
 use bytes::BytesMut;
 use futures::stream::Stream;
 use prost::Message;
+use std::error::Error;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader, ReadBuf};
 use tracing::error;
 
@@ -38,7 +40,7 @@ where
         reader: &mut BufReader<R>,
         mut buffer: &mut BytesMut,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<usize>, io::Error>> {
+    ) -> Poll<Result<Option<usize>, ProtobufStreamError>> {
         if buffer.is_empty() {
             let read_count = match Pin::new(&mut *reader).poll_fill_buf(cx) {
                 Poll::Ready(Ok(buf)) => {
@@ -48,7 +50,12 @@ where
                     buffer.extend_from_slice(buf);
                     buf.len()
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(ProtobufStreamError::NonRecoverable {
+                        code: ErrorCode::Other,
+                        source: Some(Box::new(e)),
+                    }))
+                }
                 Poll::Pending => return Poll::Pending,
             };
             reader.consume(read_count);
@@ -56,20 +63,16 @@ where
         match prost::encoding::decode_varint(&mut buffer) {
             Ok(len) => {
                 if len < MINIMUM_MESSAGE_SIZE as u64 {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "Message length {} is less than minimum size {}",
-                            len, MINIMUM_MESSAGE_SIZE
-                        ),
+                    return Poll::Ready(Err(ProtobufStreamError::recoverable(
+                        ErrorCode::InvalidMessageLength,
                     )));
                 }
                 Poll::Ready(Ok(Some(len as usize)))
             }
-            Err(e) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Failed to decode varint. decode error: ".to_owned() + &e.to_string(),
-            ))),
+            Err(e) => Poll::Ready(Err(ProtobufStreamError::Recoverable {
+                code: ErrorCode::DecodingFailed,
+                source: Some(Box::new(e)),
+            })),
         }
     }
 
@@ -78,22 +81,31 @@ where
         buffer: &mut BytesMut,
         message_size: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    ) -> Poll<Result<(), ProtobufStreamError>> {
         while buffer.len() < message_size {
             let mut temp_buf = vec![0; message_size - buffer.len()];
             let mut read_buf = ReadBuf::new(&mut temp_buf);
             match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "Unexpected EOF",
-                    )));
+                    return Poll::Ready(Err(ProtobufStreamError::NonRecoverable {
+                        code: ErrorCode::Other,
+                        source: Some(Box::new(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "Unexpected EOF",
+                        ))),
+                    }));
                 }
                 Poll::Ready(Ok(())) => {
                     buffer.extend_from_slice(read_buf.filled());
                     reader.consume(read_buf.filled().len());
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(ProtobufStreamError::Other {
+                        code: ErrorCode::Other,
+                        message: "Failed to read message payload".to_string(),
+                        source: Some(Box::new(e)),
+                    }))
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -107,7 +119,7 @@ where
     R: AsyncBufRead + Unpin,
     M: Message + Default + Unpin,
 {
-    type Item = Result<M, io::Error>;
+    type Item = Result<M, ProtobufStreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -145,17 +157,74 @@ where
                 this.buffer = new_buffer; // Update the buffer
 
                 error!("Failed to decode message: {}", e);
-                Poll::Ready(Some(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to decode message: {}", e),
-                ))))
+                Poll::Ready(Some(Err(ProtobufStreamError::Other {
+                    code: ErrorCode::Other,
+                    message: "Failed to decode message".to_string(),
+                    source: Some(Box::new(e)),
+                })))
             }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ErrorCode {
+    ConnectionLost,
+    InvalidMessageLength,
+    DecodingFailed,
+    Other,
+}
+
+#[derive(Debug, Error)]
+pub enum ProtobufStreamError {
+    /// Represents a non-recoverable error such as connection failure
+    #[error("Non-recoverable error: {code:?}")]
+    NonRecoverable {
+        code: ErrorCode,
+        #[source]
+        source: Option<Box<dyn Error + Send + Sync>>,
+    },
+
+    /// Represents recoverable errors such as decoding errors
+    #[error("Recoverable error: {code:?}")]
+    Recoverable {
+        code: ErrorCode,
+        #[source]
+        source: Option<Box<dyn Error + Send + Sync>>,
+    },
+
+    /// Represents other unexpected errors with a description and an internal error
+    #[error("{code:?}: {message}")]
+    Other {
+        code: ErrorCode,
+        message: String,
+        #[source]
+        source: Option<Box<dyn Error + Send + Sync>>,
+    },
+}
+
+impl ProtobufStreamError {
+    pub fn non_recoverable(code: ErrorCode) -> Self {
+        ProtobufStreamError::NonRecoverable { code, source: None }
+    }
+
+    pub fn recoverable(code: ErrorCode) -> Self {
+        ProtobufStreamError::Recoverable { code, source: None }
+    }
+
+    pub fn other(code: ErrorCode, message: impl Into<String>) -> Self {
+        ProtobufStreamError::Other {
+            code,
+            message: message.into(),
+            source: None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use core::panic;
+
     use bytes::Buf;
     use bytes::Bytes;
     use futures::StreamExt;
@@ -324,7 +393,20 @@ mod tests {
 
         // Read the message and expect an error
         match stream.next().await {
-            Some(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Some(Err(ProtobufStreamError::Recoverable { code, .. })) => {
+                assert_eq!(code, ErrorCode::InvalidMessageLength);
+            }
+            Some(Err(ProtobufStreamError::NonRecoverable { code, .. })) => {
+                // assert_eq!(code, ErrorCode::Other);
+                panic!("Expected a recoverable error, but got a non-recoverable error with error code: {:?}", code);
+            }
+            Some(Err(ProtobufStreamError::Other { code, .. })) => {
+                // assert_eq!(code, ErrorCode::Other);
+                panic!(
+                    "Expected a recoverable error, but got a other error with error code: {:?}",
+                    code
+                );
+            }
             Some(Ok(m)) => panic!("Expected an error, but got a message: {:?}", m),
             None => panic!("Some error expected, but got None"),
         }
