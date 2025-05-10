@@ -157,9 +157,8 @@ where
                 this.buffer = new_buffer; // Update the buffer
 
                 error!("Failed to decode message: {}", e);
-                Poll::Ready(Some(Err(ProtobufStreamError::Other {
+                Poll::Ready(Some(Err(ProtobufStreamError::Recoverable {
                     code: ErrorCode::Other,
-                    message: "Failed to decode message".to_string(),
                     source: Some(Box::new(e)),
                 })))
             }
